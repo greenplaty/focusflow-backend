@@ -1,20 +1,53 @@
 require("dotenv").config();
- 
+
 const http = require("http");
- 
-const PORT = 3000;
-const BACKEND_VERSION = "v3.9-real-ai-chat";
+
+const PORT = process.env.PORT || 3000;
+const BACKEND_VERSION = "v4.0-secured";
 const AI_API_KEY = process.env.AI_API_KEY;
 const AI_MODEL = process.env.AI_MODEL || "gpt-4o-mini";
- 
+const EXTENSION_SHARED_KEY = process.env.EXTENSION_SHARED_KEY;
+
+// -----------------------------
+// RATE LIMITING (simple in-memory, per IP)
+// -----------------------------
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_MAX_REQUESTS = 20;
+const requestLog = new Map(); // ip -> array of timestamps
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const timestamps = (requestLog.get(ip) || []).filter(
+    (t) => now - t < RATE_LIMIT_WINDOW_MS
+  );
+
+  timestamps.push(now);
+  requestLog.set(ip, timestamps);
+
+  return timestamps.length > RATE_LIMIT_MAX_REQUESTS;
+}
+
+// Occasionally clear out old entries so the map doesn't grow forever
+setInterval(function () {
+  const now = Date.now();
+  for (const [ip, timestamps] of requestLog.entries()) {
+    const fresh = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) {
+      requestLog.delete(ip);
+    } else {
+      requestLog.set(ip, fresh);
+    }
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
+
 function sendJSON(res, statusCode, data) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Headers": "Content-Type, X-Extension-Key"
   });
- 
+
   res.end(JSON.stringify(data));
 }
  
@@ -122,29 +155,42 @@ const server = http.createServer(function (req, res) {
     });
     return;
   }
- 
+
   if (req.method === "POST" && req.url === "/coach") {
+    const ip =
+      req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
+
+    if (EXTENSION_SHARED_KEY && req.headers["x-extension-key"] !== EXTENSION_SHARED_KEY) {
+      sendJSON(res, 401, { error: "Unauthorized" });
+      return;
+    }
+
+    if (isRateLimited(ip)) {
+      sendJSON(res, 429, { error: "Too many requests, try again later" });
+      return;
+    }
+
     let body = "";
- 
+
     req.on("data", function (chunk) {
       body += chunk;
- 
+
       if (body.length > 5000) {
         req.destroy();
       }
     });
- 
+
     req.on("end", async function () {
       try {
         const data = JSON.parse(body);
         const response = await getAIResponse(data);
- 
+
         sendJSON(res, 200, {
           response: response
         });
       } catch (error) {
         console.error("Coach error:", error.message);
- 
+
         sendJSON(res, 500, {
           error: error.message === "Missing AI API key"
             ? "AI coach unavailable: no AI_API_KEY set in .env"
@@ -152,7 +198,7 @@ const server = http.createServer(function (req, res) {
         });
       }
     });
-   
+
     return;
   }
  
